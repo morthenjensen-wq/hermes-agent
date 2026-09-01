@@ -169,6 +169,71 @@ def test_global_write_through_preserves_concurrent_root_update(
     assert root["credential_pool"]["openrouter"] == [{"id": "openrouter-existing"}]
 
 
+def test_codex_profile_refresh_locks_global_root_across_post(
+    profile_and_root, monkeypatch
+):
+    """Sibling profiles must serialize Codex refreshes on the root store."""
+    profile_path, root_path = profile_and_root
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "root-access",
+                        "refresh_token": "root-refresh",
+                    }
+                }
+            },
+        },
+    )
+    monkeypatch.setattr(CP, "_global_auth_file_path", lambda: root_path)
+    monkeypatch.setattr(CP, "_same_path", lambda a, b: a == b)
+
+    held_targets = []
+    post_had_root_lock = {"value": False}
+    real_lock = A._auth_store_lock
+
+    import contextlib
+
+    @contextlib.contextmanager
+    def tracking_lock(*args, **kwargs):
+        target = kwargs.get("target_path") or profile_path
+        with real_lock(*args, **kwargs):
+            held_targets.append(target)
+            try:
+                yield
+            finally:
+                held_targets.pop()
+
+    monkeypatch.setattr(A, "_auth_store_lock", tracking_lock)
+    monkeypatch.setattr(CP, "_auth_store_lock", tracking_lock)
+
+    def fake_refresh(access_token, refresh_token, **kwargs):
+        post_had_root_lock["value"] = root_path in held_targets
+        return {
+            "access_token": "rotated-access",
+            "refresh_token": "rotated-refresh",
+            "last_refresh": "2020-01-02T00:00:00Z",
+        }
+
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", fake_refresh)
+    entry = _entry(
+        "openai-codex",
+        id="codex-root",
+        access_token="root-access",
+        refresh_token="root-refresh",
+    )
+    pool = CredentialPool("openai-codex", [entry])
+
+    refreshed = pool._refresh_entry(entry, force=True)
+
+    assert refreshed is not None
+    assert post_had_root_lock["value"] is True
+
+
 def test_codex_pool_refresh_holds_auth_store_lock_across_post(monkeypatch, tmp_path):
     """The Codex OAuth pool refresh must POST under the cross-process auth lock.
 

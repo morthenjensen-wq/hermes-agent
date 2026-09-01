@@ -1046,6 +1046,28 @@ class CredentialPool:
             logger.debug("Failed to sync Anthropic OAuth entry from credential pool: %s", exc)
         return entry
 
+    def _single_use_refresh_lock_target(self, entry: PooledCredential) -> Optional[Path]:
+        """Return the auth store that owns a rotating OAuth grant.
+
+        Profile-mode agents may resolve a singleton Codex grant from the global
+        root ``auth.json``.  Locking the profile-local store in that case does
+        not serialize refreshes across sibling profiles, so two processes can
+        spend the same single-use refresh token.  Resolve the provider state
+        source before entering the refresh transaction and lock that canonical
+        store instead.  Manual pool-only credentials have no singleton source
+        and retain the historical profile-local lock.
+        """
+        if self.provider != "openai-codex" or entry.source != "device_code":
+            return None
+        try:
+            auth_store = _load_auth_store()
+            _state, source_path = _load_provider_state_with_source(
+                auth_store, "openai-codex"
+            )
+            return source_path
+        except Exception:
+            return None
+
     def _sync_codex_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
         """Sync a Codex device_code pool entry from auth.json if tokens differ.
 
@@ -1478,8 +1500,10 @@ class CredentialPool:
                 if self.provider == "xai-oauth"
                 else self._sync_anthropic_entry_from_pool_store
             )
+            refresh_lock_target = self._single_use_refresh_lock_target(entry)
             with _auth_store_lock(
-                timeout_seconds=self._single_use_refresh_lock_timeout()
+                timeout_seconds=self._single_use_refresh_lock_timeout(),
+                target_path=refresh_lock_target,
             ):
                 synced = sync_entry(entry)
                 if self.provider == "openai-codex":
